@@ -95,22 +95,39 @@ def append_yaml_file(yaml_path: Path, data: dict) -> None:
         raise yaml.YAMLError(f"Error in reading file {yaml_path}: {exc}")
 
 
-def pause(low: int = 0.5, high: int = 1) -> None:
+def pause(low: float = 0.5, high: float = 1.0) -> None:
     """
-    Hold a random pause in the range from
-    low seconds to high seconds.
-    Used to simulate user behavior.
+    Hold a random pause in seconds.
+    Guarantees genuine randomness and keeps normal action timing strictly under 5s.
     """
-    pause = round(random.uniform(low, high), 1)
-    time.sleep(pause)
+    if low <= 0 and high <= 0:
+        return
+    if low < 10:
+        high = min(float(high), 4.8)
+        if low >= high:
+            low = max(0.1, high - 0.4)
+    pause_val = round(random.uniform(low, high), 2)
+    time.sleep(pause_val)
 
 
-async def async_pause(low: float = 0.5, high: float = 1) -> None:
+async def async_pause(low: float = 0.5, high: float = 1.0) -> None:
     """
     Hold a random pause without blocking the asyncio event loop.
+    Guarantees genuine randomness and keeps normal action timing strictly under 5s.
     """
-    pause_time = round(random.uniform(low, high), 1)
+    if low <= 0 and high <= 0:
+        return
+    if low < 10:
+        high = min(float(high), 4.8)
+        if low >= high:
+            low = max(0.1, high - 0.4)
+    pause_time = round(random.uniform(low, high), 2)
     await asyncio.sleep(pause_time)
+
+
+async def async_click_pause(low: float = 0.3, high: float = 1.5) -> None:
+    """Randomized human hesitation around clicks strictly under 5 seconds."""
+    await async_pause(low, high)
 
 
 def sleep(sleep_interval: Tuple[int, int]) -> None:

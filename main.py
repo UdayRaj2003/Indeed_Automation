@@ -1,7 +1,28 @@
 """This module is used to run the LinkedIn/Indeed bot"""
 
-import asyncio
 import os
+import sys
+
+# Auto-activate / re-exec into local venv if launched with external Python
+if __name__ == "__main__":
+    _repo_root = os.path.dirname(os.path.abspath(__file__))
+    os.chdir(_repo_root)
+    if _repo_root not in sys.path:
+        sys.path.insert(0, _repo_root)
+    _venv_py = os.path.join(_repo_root, ".venv", "Scripts", "python.exe")
+    if os.path.isfile(_venv_py) and os.path.normcase(sys.executable) != os.path.normcase(_venv_py):
+        import subprocess
+
+        os.environ["VIRTUAL_ENV"] = os.path.join(_repo_root, ".venv")
+        os.environ["PATH"] = (
+            os.path.join(_repo_root, ".venv", "Scripts")
+            + os.pathsep
+            + os.environ.get("PATH", "")
+        )
+        sys.exit(subprocess.call([_venv_py] + sys.argv, cwd=_repo_root))
+
+import argparse
+import asyncio
 import traceback
 from pathlib import Path
 from threading import Lock
@@ -21,7 +42,8 @@ except (ImportError, Exception):
     PYNPUT_AVAILABLE = False
     pynput_kb = None
 
-from config.app_config import JOB_SITE, RESTART_EVERY_DAY
+import config.app_config as app_config
+from config.app_config import HEADLESS_MODE, JOB_SITE, RESTART_EVERY_DAY, TEST_MODE
 from config.constants import (
     BROWSER_STORAGE_STATE,
     RESUME_DIR,
@@ -30,6 +52,21 @@ from config.constants import (
 )
 from config.logger_config import logger
 from src.dashboard.runtime import StopRequested, emit_event, get_control_state, update_control_state
+from src.job_manager.indeed.linkedin_bridge import (
+    ai_runtime,
+    applied_csv_path,
+    get_applied_job_ids,
+    load_linkedin_configs,
+    sync_resume_files_from_linkedin,
+    sync_search_config_from_linkedin,
+)
+from src.utils.bot_control import (
+    BotStopped,
+    keep_screen_awake,
+    should_stop,
+    start_stop_controls,
+    stop_stop_controls,
+)
 
 if JOB_SITE == "indeed":
     from src.job_manager.indeed.authenticator_indeed import IndeedAuthenticator as Authenticator
@@ -112,6 +149,14 @@ class ConfigValidator:
         secrets = {**dotenv.dotenv_values(".env")}
         try:
             if JOB_SITE == "indeed":
+                if "PYTEST_CURRENT_TEST" not in os.environ:
+                    li_sec = load_linkedin_configs().get("secrets", {})
+                    if not secrets.get("indeed_email") and li_sec.get("username"):
+                        secrets["indeed_email"] = str(li_sec["username"]).strip()
+                    if not secrets.get("llm_api_key") and li_sec.get("llm_api_keys"):
+                        secrets["llm_api_key"] = str(li_sec["llm_api_keys"][0]).strip()
+                    if not secrets.get("llm_api_url") and li_sec.get("llm_api_url"):
+                        secrets["llm_api_url"] = str(li_sec["llm_api_url"]).strip()
                 required_keys = ["indeed_email"]
             else:
                 required_keys = ["linkedin_email", "linkedin_password"]
@@ -238,8 +283,8 @@ async def check_pause():
     control = get_control_state() if os.environ.get("DASHBOARD_RUN_ID") else {}
     effective_paused = paused or control.get("pause_requested", False)
 
-    if control.get("stop_requested"):
-        raise StopRequested("Dashboard requested stop")
+    if should_stop() or control.get("stop_requested"):
+        raise StopRequested("Stop requested by user/dashboard")
 
     if effective_paused != last_dashboard_pause_state:
         emit_event(
@@ -253,8 +298,8 @@ async def check_pause():
     while paused or (
         os.environ.get("DASHBOARD_RUN_ID") and get_control_state().get("pause_requested", False)
     ):
-        if os.environ.get("DASHBOARD_RUN_ID") and get_control_state().get("stop_requested"):
-            raise StopRequested("Dashboard requested stop")
+        if should_stop() or (os.environ.get("DASHBOARD_RUN_ID") and get_control_state().get("stop_requested")):
+            raise StopRequested("Stop requested by user/dashboard")
         await asyncio.sleep(0.5)
 
     if last_dashboard_pause_state:
@@ -268,13 +313,14 @@ async def create_and_run_bot(
     resume_text: str,
     resume_structured: dict,
 ):
-    """Start LinkedIn bot (async)"""
-    logger.info("Initializing LinkedIn bot...")
+    """Start LinkedIn/Indeed bot (async)"""
+    site_label = "Indeed" if JOB_SITE == "indeed" else "LinkedIn"
+    logger.info(f"Initializing {site_label} bot...")
     # Fresh shutdown state per run (matters when RESTART_EVERY_DAY loops runs)
     runtime_controller.set_shutdown_state(ShutdownState.RUNNING)
     emit_event(
         "run_started",
-        "LinkedIn bot run started",
+        f"{site_label} bot run started",
         positions=search_config.get("positions", []),
         locations=search_config.get("locations", []),
     )
@@ -306,19 +352,22 @@ async def create_and_run_bot(
         authenticator.set_parameters(site_email, site_password)
 
         # Attempt login
+        site_label = "Indeed" if JOB_SITE == "indeed" else "LinkedIn"
         login_success = await authenticator.start()
         if login_success:
             await save_browser_session(context)
-            logger.info("Successfully logged into LinkedIn!")
-            logger.info("LinkedIn bot ready to work")
-            emit_event("login_success", "LinkedIn login succeeded")
+            logger.info(f"Successfully logged into {site_label}!")
+            logger.info(f"{site_label} bot ready to work")
+            emit_event("login_success", f"{site_label} login succeeded")
         else:
-            logger.error("Failed to log into LinkedIn")
-            emit_event("run_failed", "LinkedIn login failed")
+            logger.error(f"Failed to log into {site_label}")
+            emit_event("run_failed", f"{site_label} login failed")
             return False
 
         # Set GPT answerer
-        llm_api_key = secrets.get("llm_api_key")
+        llm_api_key = (ai_runtime.current_api_key() if JOB_SITE == "indeed" else None) or secrets.get(
+            "llm_api_key"
+        )
         llm_proxy = secrets.get("llm_proxy")
         llm_api_url = secrets.get("llm_api_url")
         llm_answerer_component = GPTAnswerer(llm_api_key, llm_proxy, llm_api_url)
@@ -375,21 +424,34 @@ async def create_and_run_bot(
             )
             return True
 
-        # Validate structured resume and prompt user if needed (skip when launched from dashboard)
-        if not os.environ.get("DASHBOARD_RUN_ID") and not validate_and_prompt_resume_completion(
-            resume_structured, RESUME_STRUCTURED_FILE, RESUME_TEXT_FILE
+        # Validate structured resume and prompt user if needed (skip when Indeed or launched from dashboard)
+        if (
+            JOB_SITE != "indeed"
+            and not os.environ.get("DASHBOARD_RUN_ID")
+            and not validate_and_prompt_resume_completion(
+                resume_structured, RESUME_STRUCTURED_FILE, RESUME_TEXT_FILE
+            )
         ):
             logger.info("User chose to exit and complete resume information")
             emit_event("run_stopped", "Run stopped because resume validation was not accepted")
             return False
 
-        await bot.set_search_parameters(search_config)
+        if JOB_SITE == "indeed":
+            li_search = load_linkedin_configs().get("search", {})
+            await bot.set_search_parameters(
+                search_config,
+                per_term=True,
+                randomize=bool(li_search.get("randomize_search_order", False)),
+            )
+        else:
+            await bot.set_search_parameters(search_config)
         bot.set_answerer_and_agent(llm_answerer_component, llm_agent_component, search_config)
         bot.set_resume(resume_structured, resume_text, resume_text_anonymized)
         if not resume_ready_made:
             bot.set_resume_generator(resume_generator_manager)
         await bot.start_apply()
-        emit_event("run_completed", "LinkedIn bot run completed successfully")
+        emit_event("run_completed", f"{site_label} bot run completed successfully")
+        return True
 
     finally:
         # Cleanup browser resources
@@ -404,6 +466,8 @@ async def create_and_run_bot(
                 await browser.close()
             elif context is not None:
                 await context.close()
+            # Yield briefly so Windows ProactorEventLoop drains subprocess pipes cleanly.
+            await asyncio.sleep(0.1)
             logger.info("Playwright browser closed")
             emit_event("browser_closed", "Playwright browser closed")
 
@@ -415,7 +479,28 @@ async def create_and_run_bot(
             runtime_controller.finish_run()
 
 
+def _parse_cli_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="LinkedIn / Indeed AI Job Bot")
+    parser.add_argument("--once", action="store_true", help="Run a single cycle and exit")
+    parser.add_argument("--test", action="store_true", help="Run with TEST_MODE=True (do not submit)")
+    parser.add_argument("--no-ui", action="store_true", help="Disable floating STOP BOT window")
+    args, _ = parser.parse_known_args()
+    return args
+
+
+def _apply_runtime_test_mode() -> None:
+    import src.job_manager.indeed.easy_applier_indeed as eai
+    import src.job_manager.indeed.job_manager_indeed as jmi
+    import src.job_manager.job_manager as jm
+
+    app_config.TEST_MODE = True
+    jm.TEST_MODE = True
+    jmi.TEST_MODE = True
+    eai.TEST_MODE = True
+
+
 def main() -> None:
+    args = _parse_cli_args()
     # Start keyboard listener for pause/resume functionality
     # Local runtime patch: register graceful shutdown handlers once at startup.
     register_shutdown_handlers()
@@ -423,83 +508,130 @@ def main() -> None:
     if not os.environ.get("DASHBOARD_RUN_ID"):
         update_control_state(stop_requested=False, pause_requested=False)
 
-    while True:
-        should_exit = False
-        try:
-            # create output folder if it doesn't exist
-            data = Path("data")
-            output_folder = data / "output"
-            output_folder.mkdir(exist_ok=True)
-            linkedin_output_folder = output_folder / "linkedin"
-            linkedin_output_folder.mkdir(exist_ok=True)
-            indeed_output_folder = output_folder / "indeed"
-            indeed_output_folder.mkdir(exist_ok=True)
+    if args.test:
+        _apply_runtime_test_mode()
+        logger.info("CLI --test flag active: TEST_MODE forced to True")
 
-            # validate config files
-            config_validator = ConfigValidator()
-            secrets = config_validator.validate_secrets()
-            search_config = config_validator.validate_search_config(SEARCH_CONFIG_FILE)
-            resume_text = config_validator.validate_resume_text(RESUME_TEXT_FILE)
-            if not resume_text:
-                resume_text = generate_resume_text_from_pdf(secrets)
-            resume_structured = config_validator.validate_resume_structured(RESUME_STRUCTURED_FILE)
+    is_pytest = "PYTEST_CURRENT_TEST" in os.environ
+    li_sett = load_linkedin_configs().get("settings", {}) if JOB_SITE == "indeed" else {}
+    run_non_stop = (
+        JOB_SITE == "indeed"
+        and bool(li_sett.get("run_non_stop", False))
+        and not args.once
+        and not args.test
+        and not TEST_MODE
+        and not is_pytest
+    )
+    max_dead_cycles = int(li_sett.get("max_dead_cycles", 3) or 3)
+    dead_cycles = 0
 
-            if not resume_text and not resume_structured:
-                raise FileNotFoundError(
-                    f"Can't find neither resume text file {RESUME_TEXT_FILE} nor resume structured file {RESUME_STRUCTURED_FILE}"
-                )
+    if JOB_SITE == "indeed" and not is_pytest:
+        ai_runtime.reload()
+        if not args.no_ui and not HEADLESS_MODE:
+            start_stop_controls()
+        if bool(li_sett.get("run_in_background", False)) or run_non_stop:
+            keep_screen_awake(True)
 
-            logger.info(f"Starting {JOB_SITE.capitalize()} Job Applier...")
-            logger.info(f"Search config loaded with {len(search_config)} parameters")
+    try:
+        while True:
+            should_exit = False
+            before_applied = (
+                len(get_applied_job_ids(applied_csv_path()))
+                if (JOB_SITE == "indeed" and not is_pytest)
+                else 0
+            )
+            try:
+                if should_stop():
+                    raise StopRequested("Stop requested before cycle")
 
-            asyncio.run(create_and_run_bot(search_config, secrets, resume_text, resume_structured))
-            logger.info(f"{JOB_SITE.capitalize()} bot completed successfully")
+                # create output folder if it doesn't exist
+                data = Path("data")
+                output_folder = data / "output"
+                output_folder.mkdir(exist_ok=True)
+                linkedin_output_folder = output_folder / "linkedin"
+                linkedin_output_folder.mkdir(exist_ok=True)
+                indeed_output_folder = output_folder / "indeed"
+                indeed_output_folder.mkdir(exist_ok=True)
 
-        except StopRequested as stop_requested:
-            logger.warning(str(stop_requested))
-            emit_event("run_stopped", "Run stopped gracefully by dashboard")
-            should_exit = True
+                if JOB_SITE == "indeed" and not is_pytest:
+                    sync_resume_files_from_linkedin(Path(RESUME_DIR))
+                    sync_search_config_from_linkedin(Path(SEARCH_CONFIG_FILE))
 
-        except StopRequested as stop_requested:
-            logger.warning(str(stop_requested))
-            emit_event("run_stopped", "Run stopped gracefully by dashboard")
-            should_exit = True
+                # validate config files
+                config_validator = ConfigValidator()
+                secrets = config_validator.validate_secrets()
+                search_config = config_validator.validate_search_config(SEARCH_CONFIG_FILE)
+                resume_text = config_validator.validate_resume_text(RESUME_TEXT_FILE)
+                if not resume_text:
+                    resume_text = generate_resume_text_from_pdf(secrets)
+                resume_structured = config_validator.validate_resume_structured(RESUME_STRUCTURED_FILE)
 
-        except StopRequested as stop_requested:
-            logger.warning(str(stop_requested))
-            emit_event("run_stopped", "Run stopped gracefully by dashboard")
-            should_exit = True
+                if not resume_text and not resume_structured:
+                    raise FileNotFoundError(
+                        f"Can't find neither resume text file {RESUME_TEXT_FILE} nor resume structured file {RESUME_STRUCTURED_FILE}"
+                    )
 
-        except ConfigError as ce:
-            logger.error(f"Configuration error: {str(ce)}")
-            emit_event("run_failed", "Configuration error", error=str(ce))
-        except FileNotFoundError as fnf:
-            tb_str = traceback.format_exc()
-            logger.error(f"File not found: {str(fnf)}\n{tb_str}")
-            emit_event("run_failed", "Required file was not found", error=str(fnf))
-        except RuntimeError as re:
-            tb_str = traceback.format_exc()
-            logger.error(f"Runtime error: {str(re)}\n{tb_str}")
-            emit_event("run_failed", "Runtime error", error=str(re))
-        except Exception as e:
-            tb_str = traceback.format_exc()
-            logger.error(f"Unknown error: {str(e)}\n{tb_str}")
-            emit_event("run_failed", "Unhandled exception", error=str(e))
-        finally:
-            logger.info("Program completed")
-            # Wait 1 hour total before next run
-            if RESTART_EVERY_DAY and not should_exit:
-                logger.info("Waiting 1 hour before next run")
-                # Local runtime patch: make the daily wait interruptible.
-                if not asyncio.run(sleep_with_shutdown(3600)):
-                    logger.info("Shutdown requested during wait interval")
-                    should_exit = True
-            else:
-                logger.info("Exiting program")
+                logger.info(f"Starting {JOB_SITE.capitalize()} Job Applier...")
+                logger.info(f"Search config loaded with {len(search_config)} parameters")
+
+                asyncio.run(create_and_run_bot(search_config, secrets, resume_text, resume_structured))
+                logger.info(f"{JOB_SITE.capitalize()} bot completed successfully")
+
+                if run_non_stop:
+                    after_applied = len(get_applied_job_ids(applied_csv_path()))
+                    if after_applied <= before_applied:
+                        dead_cycles += 1
+                        logger.info(f"Dead cycle {dead_cycles}/{max_dead_cycles} (0 new applications)")
+                        if dead_cycles >= max_dead_cycles:
+                            logger.info("Reached max_dead_cycles; stopping non-stop loop")
+                            should_exit = True
+                    else:
+                        dead_cycles = 0
+
+            except (StopRequested, BotStopped) as stop_requested:
+                logger.warning(str(stop_requested))
+                emit_event("run_stopped", "Run stopped gracefully")
                 should_exit = True
 
-        if should_exit:
-            break
+            except ConfigError as ce:
+                logger.error(f"Configuration error: {str(ce)}")
+                emit_event("run_failed", "Configuration error", error=str(ce))
+            except FileNotFoundError as fnf:
+                tb_str = traceback.format_exc()
+                logger.error(f"File not found: {str(fnf)}\n{tb_str}")
+                emit_event("run_failed", "Required file was not found", error=str(fnf))
+            except RuntimeError as re:
+                tb_str = traceback.format_exc()
+                logger.error(f"Runtime error: {str(re)}\n{tb_str}")
+                emit_event("run_failed", "Runtime error", error=str(re))
+            except Exception as e:
+                tb_str = traceback.format_exc()
+                logger.error(f"Unknown error: {str(e)}\n{tb_str}")
+                emit_event("run_failed", "Unhandled exception", error=str(e))
+            finally:
+                logger.info("Program completed")
+                if should_exit:
+                    pass
+                elif run_non_stop and not should_stop():
+                    logger.info("run_non_stop active: waiting 10 minutes before next cycle")
+                    if not asyncio.run(sleep_with_shutdown(600)):
+                        logger.info("Shutdown requested during non-stop wait interval")
+                        should_exit = True
+                elif RESTART_EVERY_DAY:
+                    logger.info("Waiting 1 hour before next run")
+                    # Local runtime patch: make the daily wait interruptible.
+                    if not asyncio.run(sleep_with_shutdown(3600)):
+                        logger.info("Shutdown requested during wait interval")
+                        should_exit = True
+                else:
+                    logger.info("Exiting program")
+                    should_exit = True
+
+            if should_exit:
+                break
+    finally:
+        if JOB_SITE == "indeed" and not is_pytest:
+            stop_stop_controls()
 
 
 if __name__ == "__main__":

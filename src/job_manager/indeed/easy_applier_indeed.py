@@ -11,9 +11,16 @@ from config.app_config import UPLOAD_RESUME
 from config.logger_config import logger
 from src.dashboard.runtime import StopRequested, capture_page_screenshot, emit_event
 from src.job_manager.easy_applier import BaseEasyApplier, NoInfoException
+from src.job_manager.indeed.authenticator_indeed import IndeedAuthenticator
+from src.job_manager.indeed.linkedin_bridge import (
+    answer_from_linkedin_data,
+    load_linkedin_configs,
+    upsert_saved_answers,
+)
 from src.job_manager.resume_anonymizer import ResumeAnonymizer
 from src.llm.llm_manager import GPTAnswerer
 from src.pydantic_models.job_models import Job, Question
+from src.utils.bot_control import should_stop
 from src.utils.browser_utils import (
     debug_capture,
     find_element_safely,
@@ -25,16 +32,33 @@ from src.utils.browser_utils import (
 from src.utils.utils import async_pause, get_ready_made_resume, load_yaml_file
 
 INDEED_APPLY_BUTTON_SELECTOR = (
+    "a[data-testid='viewjob-indeed-apply'], "
+    "button[data-testid='viewjob-indeed-apply'], "
     "span.indeed-apply-status-not-applied button, "
     "button[aria-label*='Apply with Indeed'], "
     "button[aria-label*='Indeed Apply'], "
     "button#indeedApplyButton, "
+    "button[data-testid='indeedApplyButton-test'], "
     "button[data-jk], "
     ".ia-IndeedApplyButton"
 )
 INDEED_APPLY_MODAL_SELECTOR = "div.ia-BasePage, div[data-testid='ia-container']"
-INDEED_NEXT_BUTTON_SELECTOR = "button[data-testid='continue-button'], button[data-testid^='hp-continue-button'], button[data-testid='ia-continueButton'], .ia-BasePage-component button:has-text('Continue'), button:has-text('Review your application'), button:has-text('Continue')"
-INDEED_SUBMIT_BUTTON_SELECTOR = "button[data-testid='ia-submitButton'], button.ia-submitButton, button[data-testid='submit-application-button']"
+INDEED_NEXT_BUTTON_SELECTOR = (
+    "button[data-testid='continue-button'], "
+    "button[data-testid^='hp-continue-button'], "
+    "button[data-testid='ia-continueButton'], "
+    ".ia-BasePage-component button:has-text('Continue'), "
+    "button:has-text('Review your application'), "
+    "button:has-text('Continue'), "
+    "button:has-text('Next')"
+)
+INDEED_SUBMIT_BUTTON_SELECTOR = (
+    "button[data-testid='ia-submitButton'], "
+    "button.ia-submitButton, "
+    "button[data-testid='submit-application-button'], "
+    "button:has-text('Submit your application'), "
+    "button:has-text('Submit application')"
+)
 
 
 class IndeedEasyApplier(BaseEasyApplier):
@@ -51,6 +75,10 @@ class IndeedEasyApplier(BaseEasyApplier):
         resume_dir: Path,
         cover_letter_dir: Path,
         test_mode: bool,
+        *,
+        use_linkedin_bridge: bool = False,
+        pre_resolved_resume_path: str | None = None,
+        saved_answers_path: Path | None = None,
     ):
         self.page = page
         self.gpt_answerer = gpt_answerer
@@ -61,9 +89,16 @@ class IndeedEasyApplier(BaseEasyApplier):
         self.resume_dir = resume_dir
         self.cover_letter_dir = cover_letter_dir
         self.test_mode = test_mode
+        self.use_linkedin_bridge = use_linkedin_bridge
+        self.pre_resolved_resume_path = pre_resolved_resume_path
+        self.saved_answers_path = saved_answers_path
+        self.current_job: Any = None
         self.submitted_resume_path = None
         self.all_questions: List[Question] = self._load_questions()
         self.previous_question_texts: List[str] = []
+        self.encountered_questions: List[Tuple[str, Any, str]] = []
+        self._opened_extra_page: Any = None
+        self._bot_filled_values: dict[str, str] = {}
         self.generated_resume_dir = Path(resume_dir) / "generated_resumes"
         self.ready_made_resume_path = get_ready_made_resume()
 
@@ -76,9 +111,14 @@ class IndeedEasyApplier(BaseEasyApplier):
     # Public interface
     # ------------------------------------------------------------------
 
-    async def apply_to_job(self, job: Job) -> Tuple[Tuple[str, str], Any]:
-        """Entry point - navigate to job page and apply"""
-        logger.info(f"Navigating to Indeed job: {job.url}")
+    async def apply_to_job(
+        self, job: Job, skip_navigation: bool = False
+    ) -> Tuple[Tuple[str, str], Any]:
+        """Entry point - navigate to job page (unless already loaded) and apply"""
+        if not skip_navigation:
+            logger.info(f"Navigating to Indeed job: {job.url}")
+        else:
+            logger.info(f"Initiating apply flow for '{job.job_title}' at '{job.company_name}'")
         emit_event(
             "easy_apply_started",
             f"Easy Apply started for {job.job_title}",
@@ -86,9 +126,10 @@ class IndeedEasyApplier(BaseEasyApplier):
             company_name=job.company_name,
             url=job.url,
         )
-        await self.page.goto(job.url)
-        logger.info(f"Page loaded: {job.url}")
-        await async_pause(1, 2)
+        if not skip_navigation:
+            await self.page.goto(job.url)
+            logger.info(f"Page loaded: {job.url}")
+            await async_pause(1, 2)
         apply_result = await self.job_easy_apply(job)
         return apply_result, self.submitted_resume_path
 
@@ -99,27 +140,69 @@ class IndeedEasyApplier(BaseEasyApplier):
         """
         cover_letter = ""
         self.current_job = job
+        initial_page = self.page
+        self._opened_extra_page = None
+        self.submitted_resume_path = None
+        self.encountered_questions = []
+        self._bot_filled_values = {}
         try:
+            if self.use_linkedin_bridge and await IndeedAuthenticator.is_security_challenge(self.page):
+                cleared = await IndeedAuthenticator(self.page).wait_for_manual_challenge_if_present()
+                if not cleared:
+                    return "Skip", "Security verification / CAPTCHA not cleared"
+
             apply_btn = await self._find_apply_button(job)
             if not apply_btn:
                 logger.warning(f"No apply button found for: {job.job_title} at {job.company_name}")
                 return "Skip", cover_letter
+            logger.info(f"Apply button located for '{job.job_title}'. Opening application form...")
 
             try:
-                async with self.page.context.expect_page(timeout=10000) as new_page_info:
+                async with self.page.context.expect_page(timeout=4000) as new_page_info:
                     await apply_btn.click()
                 new_page = await new_page_info.value
-                await new_page.wait_for_load_state("domcontentloaded")
-                self.page = new_page
-                logger.info("Application form opened in new tab, switched to it")
+                if new_page is not None and new_page is not initial_page:
+                    await new_page.wait_for_load_state("domcontentloaded")
+                    self._opened_extra_page = new_page
+                    self.page = new_page
+                    logger.info("Application form opened in new tab, switched to it")
             except Exception:
-                # No new tab — form is a modal on the current page
-                logger.debug("No new tab opened, form is modal on current page")
+                # No new tab — form is a modal or navigated on the current page
+                logger.debug("No new tab opened, form is modal or same-tab navigation")
                 await async_pause(1, 2)
 
+            if getattr(type(self.page), "__module__", "").startswith(("playwright", "patchright")):
+                try:
+                    await self.page.wait_for_selector(
+                        "[data-testid='resume-selection-form'], "
+                        "[data-testid='profile-location-page'], "
+                        "[data-testid='relevant-experience-page'], "
+                        "[data-testid='review-page'], "
+                        "div.ia-Questions-item, "
+                        "div[data-testid='ia-Questions-item'], "
+                        "button[data-testid='continue-button'], "
+                        "button[data-testid='ia-continueButton'], "
+                        "button[data-testid='ia-submitButton'], "
+                        "button:has-text('Continue'), "
+                        "button:has-text('Submit your application')",
+                        timeout=20000,
+                    )
+                except Exception:
+                    pass
+
+            if self.use_linkedin_bridge and await IndeedAuthenticator.is_security_challenge(self.page):
+                cleared = await IndeedAuthenticator(self.page).wait_for_manual_challenge_if_present()
+                if not cleared:
+                    return "Skip", "Security verification / CAPTCHA not cleared"
+
             await capture_page_screenshot(self.page, "easy-apply-opened")
+            self._reached_submit_page = True
             cover_letter = await self._fill_application_form(job)
             if self.test_mode:
+                if not self._reached_submit_page:
+                    logger.warning("TEST_MODE: application form did not reach submit page")
+                    await self._discard_application()
+                    return "Skip", "Did not reach submit page"
                 logger.info("TEST_MODE: skipping form submission")
                 await self._discard_application()
                 emit_event(
@@ -159,6 +242,16 @@ class IndeedEasyApplier(BaseEasyApplier):
             except Exception:
                 logger.error(f"Error discarding application: {e}", exc_info=True)
             return "Error", cover_letter
+        finally:
+            if self._opened_extra_page is not None and self._opened_extra_page is not initial_page:
+                try:
+                    is_closed_fn = getattr(self._opened_extra_page, "is_closed", None)
+                    if callable(is_closed_fn) and is_closed_fn() is False:
+                        await self._opened_extra_page.close()
+                except Exception:
+                    pass
+                self.page = initial_page
+                self._opened_extra_page = None
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -167,7 +260,7 @@ class IndeedEasyApplier(BaseEasyApplier):
     async def _find_apply_button(self, job: Job) -> Any:
         """Locate the Indeed apply button on the job detail page"""
         for selector in INDEED_APPLY_BUTTON_SELECTOR.split(", "):
-            btn = await find_element_safely(self.page, selector.strip(), timeout=10000)
+            btn = await find_element_safely(self.page, selector.strip(), timeout=2000)
             if btn:
                 logger.info(f"Found apply button: {selector.strip()}")
                 return btn
@@ -178,7 +271,10 @@ class IndeedEasyApplier(BaseEasyApplier):
     async def _fill_application_form(self, job: Job) -> str:
         """Step through multi-page Indeed application form and fill fields"""
         cover_letter = ""
-        max_steps = 10
+        max_steps = 15
+        self._reached_submit_page = False
+        last_stuck_sig = None
+        same_step_repeats = 0
 
         for step in range(max_steps):
             logger.info(f"Application form step {step + 1}")
@@ -196,7 +292,24 @@ class IndeedEasyApplier(BaseEasyApplier):
             )
             if submit_btn:
                 logger.info("Reached submit page")
+                self._reached_submit_page = True
+                if self.use_linkedin_bridge:
+                    q_cfg = load_linkedin_configs().get("questions", {})
+                    if q_cfg.get("pause_before_submit", False):
+                        logger.info("pause_before_submit is enabled — pausing for review before submitting")
+                        await async_pause(2.5, 4.5)
+                    await self._capture_manual_edits()
                 break
+
+            step_sig = (getattr(self.page, "url", ""), tuple(self.previous_question_texts))
+            if step_sig == last_stuck_sig and self.previous_question_texts:
+                same_step_repeats += 1
+                if same_step_repeats >= 2:
+                    logger.warning("Application form stuck on identical validation step; aborting loop")
+                    break
+            else:
+                last_stuck_sig = step_sig
+                same_step_repeats = 0
 
             # Click next — find first *visible* button across the ordered selectors
             next_btn = await self._find_visible_next_button()
@@ -205,18 +318,22 @@ class IndeedEasyApplier(BaseEasyApplier):
                 await debug_capture(self.page, "indeed_no_next_button")
                 break
 
+            if self.use_linkedin_bridge:
+                await self._capture_manual_edits()
+
             current_page_testid = await get_current_page_testid(
                 self.page,
                 ["resume-selection-form", "profile-location-page", "relevant-experience-page"],
             )
+            await async_pause(0.3, 0.9)
             await next_btn.click()
-            await async_pause(1, 2)
+            await async_pause(0.8, 1.8)
             await wait_for_page_transition(self.page, current_page_testid)
             try:
                 await self.page.wait_for_load_state("domcontentloaded")
             except Exception as e:
                 logger.warning(f"Error waiting for page to load: {e}")
-            await async_pause(1, 2)
+            await async_pause(0.8, 1.6)
 
             # Retry up to 3 times if validation errors remain after clicking next
             for _ in range(3):
@@ -227,8 +344,9 @@ class IndeedEasyApplier(BaseEasyApplier):
                 next_btn = await self._find_visible_next_button()
                 if not next_btn:
                     break
+                await async_pause(0.3, 0.9)
                 await next_btn.click()
-                await async_pause(2, 3)
+                await async_pause(1.5, 2.5)
 
         return cover_letter
 
@@ -251,9 +369,27 @@ class IndeedEasyApplier(BaseEasyApplier):
         """Fill visible form fields on the current step"""
         try:
             # Handle special-case pages first
-            if await find_element_safely(
+            resume_page = await find_element_safely(
                 self.page, "[data-testid='resume-selection-form']", timeout=1000
+            )
+            if (
+                not resume_page
+                and not self.submitted_resume_path
+                and (UPLOAD_RESUME or self.pre_resolved_resume_path)
             ):
+                # Phoenix SmartApply saved-CV cards render 'CV options' without resume-selection-form.
+                resume_page = await find_element_safely(
+                    self.page,
+                    "button:has-text('CV options'), "
+                    "button:has-text('Resume options'), "
+                    "[aria-label*='CV options'], "
+                    "[aria-label*='Resume options'], "
+                    "button:has-text('Upload a different resume'), "
+                    "button:has-text('Upload a different file')",
+                    timeout=800,
+                )
+            if resume_page:
+                logger.info("Resume step detected in application form. Selecting / uploading resume...")
                 await self.page.wait_for_load_state("domcontentloaded")
                 await self._handle_resume_selection(job)
                 return
@@ -285,10 +421,56 @@ class IndeedEasyApplier(BaseEasyApplier):
             logger.error(f"Error filling form step: {e}", exc_info=True)
             await debug_capture(self.page, "indeed_fill_form_error")
 
+    async def _trigger_resume_upload(self, trigger_btn: Any, abs_path: str | None) -> bool:
+        """Click an upload menu item/button, handling native file chooser if opened, or falling back to input[type='file']."""
+        if not abs_path:
+            return False
+        clicked = False
+        expect_fc = getattr(self.page, "expect_file_chooser", None)
+        if callable(expect_fc):
+            try:
+                fc_cm = expect_fc(timeout=5000)
+                async with fc_cm as fc_info:
+                    clicked = True
+                    try:
+                        await trigger_btn.click(force=True)
+                    except TypeError:
+                        await trigger_btn.click()
+                file_chooser = await fc_info.value
+                await file_chooser.set_files(abs_path)
+                await async_pause(1, 2)
+                self.submitted_resume_path = abs_path
+                logger.info(f"Uploaded resume via file chooser: {abs_path}")
+                return True
+            except Exception as e:
+                logger.debug(f"File chooser not intercepted or timed out: {e}")
+        if not clicked:
+            try:
+                await trigger_btn.click(force=True)
+            except TypeError:
+                await trigger_btn.click()
+            except Exception as e:
+                logger.debug(f"trigger_btn click failed: {e}")
+        await async_pause(0.5, 1)
+
+        # Post-click fallback: check if input[type='file'] appeared in DOM
+        try:
+            file_input = await find_element_safely(self.page, "input[type='file']", timeout=2000)
+            if file_input:
+                await file_input.set_input_files(abs_path)
+                await async_pause(1, 2)
+                self.submitted_resume_path = abs_path
+                logger.info(f"Uploaded resume via post-click file input: {abs_path}")
+                return True
+        except Exception as e:
+            logger.debug(f"Post-click file input set failed: {e}")
+
+        return False
+
     async def _handle_resume_selection(self, job: Job) -> None:
         """Select resume: use Indeed Resume if UPLOAD_RESUME is False, otherwise upload a file"""
         try:
-            if not UPLOAD_RESUME:
+            if not UPLOAD_RESUME and not self.pre_resolved_resume_path:
                 indeed_resume_radio = await find_element_safely(
                     self.page,
                     "input[data-testid='resume-selection-structured-resume-radio-card-input']",
@@ -327,19 +509,79 @@ class IndeedEasyApplier(BaseEasyApplier):
                     await async_pause(0.5, 1)
                     logger.info("Selected 'Upload a resume' radio option")
 
+            resume_candidate = self.pre_resolved_resume_path or self.ready_made_resume_path
+            abs_path = os.path.abspath(str(resume_candidate)) if resume_candidate is not None else None
+            logger.info(f"Resume selection step: target file to upload is {abs_path}")
+
             file_input = await find_element_safely(
                 self.page,
                 "input[data-testid='resume-selection-file-resume-upload-radio-card-file-input']",
-                timeout=2000,
+                timeout=1500,
             )
+            if not file_input:
+                options_btn = await find_element_safely(
+                    self.page,
+                    "button:has-text('CV options'), button:has-text('Resume options'), "
+                    "[aria-label*='CV options'], [aria-label*='Resume options'], "
+                    "[data-testid*='options']",
+                    timeout=1000,
+                )
+                if options_btn:
+                    try:
+                        logger.info("Clicking 'CV options' dropdown menu...")
+                        await options_btn.click()
+                        await async_pause(0.4, 0.9)
+                    except Exception as e:
+                        logger.debug(f"Clicking CV options failed: {e}")
+
+                alt_btn = await find_element_safely(
+                    self.page,
+                    "[role='menuitem']:has-text('Upload a different file'), "
+                    "button:has-text('Upload a different file'), "
+                    "div:has-text('Upload a different file'), "
+                    "span:has-text('Upload a different file'), "
+                    "li:has-text('Upload a different file'), "
+                    "a:has-text('Upload a different file'), "
+                    "label:has-text('Upload a different file'), "
+                    ":text-is('Upload a different file'), "
+                    "button:has-text('Upload a different resume'), "
+                    "[role='menuitem']:has-text('Upload a different resume'), "
+                    "div:has-text('Upload a different resume'), "
+                    "button:has-text('Replace'), "
+                    "button:has-text('Upload a resume'), "
+                    "label[for*='resume-upload']",
+                    timeout=1500,
+                )
+                if not alt_btn:
+                    try:
+                        get_by_text = getattr(self.page, "get_by_text", None)
+                        if callable(get_by_text):
+                            for txt in ("Upload a different file", "Upload a different resume", "Upload a resume"):
+                                candidate = get_by_text(txt, exact=False).first
+                                if await candidate.count() > 0:
+                                    alt_btn = candidate
+                                    break
+                    except Exception:
+                        pass
+
+                if alt_btn:
+                    try:
+                        logger.info("Found 'Upload a different file' option, triggering upload...")
+                        if await self._trigger_resume_upload(alt_btn, abs_path):
+                            return
+                    except Exception as e:
+                        logger.debug(f"Error triggering resume upload: {e}")
+                file_input = await find_element_safely(self.page, "input[type='file']", timeout=2000)
+
             if not file_input:
                 logger.warning("Resume file input not found on resume selection page")
                 return
 
-            if self.ready_made_resume_path is not None:
-                abs_path = os.path.abspath(str(self.ready_made_resume_path))
+            if abs_path is not None:
                 await file_input.set_input_files(abs_path)
-                logger.info(f"Uploaded ready-made resume: {abs_path}")
+                await async_pause(1, 2)
+                self.submitted_resume_path = abs_path
+                logger.info(f"Uploaded resume: {abs_path}")
             else:
                 await self._create_and_upload_resume(file_input, job)
         except Exception as e:
@@ -353,9 +595,11 @@ class IndeedEasyApplier(BaseEasyApplier):
             if self.gpt_answerer and hasattr(self.gpt_answerer, "resume_structured"):
                 personal = self.gpt_answerer.resume_structured.get("personal_information", {})
 
-            postal_code = str(personal.get("zip_code", "") or "")
-            city = str(personal.get("city", "") or "")
-            address = str(personal.get("address", "") or "")
+            li_p = load_linkedin_configs().get("personals", {}) if self.use_linkedin_bridge else {}
+            postal_code = str(personal.get("zip_code", "") or li_p.get("zipcode", "") or "")
+            city = str(personal.get("city", "") or li_p.get("current_city", "") or "")
+            address = str(personal.get("address", "") or li_p.get("street", "") or "")
+            phone = str(personal.get("phone", "") or li_p.get("phone_number", "") or "")
 
             if postal_code:
                 field = await find_element_safely(
@@ -382,6 +626,18 @@ class IndeedEasyApplier(BaseEasyApplier):
                 if field:
                     await field.fill(address)
                     logger.debug(f"Filled street address: {address}")
+
+            if phone and self.use_linkedin_bridge:
+                phone_field = await find_element_safely(
+                    self.page,
+                    "input[data-testid*='phone'], input[type='tel']",
+                    timeout=1000,
+                )
+                if phone_field:
+                    current_phone = (await phone_field.input_value() or "").strip()
+                    if not current_phone:
+                        await phone_field.fill(phone)
+                        logger.debug(f"Filled phone number: {phone}")
 
         except Exception as e:
             logger.error(f"Error filling profile location page: {e}", exc_info=True)
@@ -414,6 +670,10 @@ class IndeedEasyApplier(BaseEasyApplier):
                 most_recent = experience_details[0]
                 position = str(most_recent.get("position", "") or "")
                 company = str(most_recent.get("company", "") or "")
+            if self.use_linkedin_bridge and (not position or not company):
+                li_q = load_linkedin_configs().get("questions", {})
+                position = position or str(li_q.get("linkedin_headline", "") or "Software Engineer").split("|")[0].strip()
+                company = company or str(li_q.get("recent_employer", "") or "")
 
             title_input = await find_element_safely(
                 self.page, "input[data-testid='job-title-input']", timeout=2000
@@ -631,34 +891,140 @@ class IndeedEasyApplier(BaseEasyApplier):
     async def _handle_terms_of_service(self, section: Any) -> bool:
         return False
 
+    async def _resolve_question_answer(
+        self,
+        question_text: str,
+        question_type: str,
+        ai_fn: Any,
+        *,
+        options: list[str] | None = None,
+        postprocess: Any = None,
+        raise_on_no_info: bool = True,
+    ) -> Any:
+        """Resolve an answer via cache -> Linkedin_Test saved/config data -> AI, persisting AI answers."""
+        cached = self._find_cached_question(question_text, question_type)
+        existing_answer = cached.answer if cached else None
+        if existing_answer:
+            logger.debug(f"Using cached {question_type} answer for '{question_text}': '{existing_answer}'")
+            if self.use_linkedin_bridge:
+                self.encountered_questions.append((question_text, existing_answer, question_type))
+            return existing_answer
+
+        if self.use_linkedin_bridge:
+            work_loc = getattr(self.current_job, "work_location", "") if getattr(self, "current_job", None) else ""
+            bridge_ans = answer_from_linkedin_data(
+                question_text,
+                options=options,
+                question_type=question_type,
+                work_location=work_loc,
+                saved_answers_file=self.saved_answers_path,
+            )
+            if bridge_ans is not None and not self._is_no_info_answer(str(bridge_ans)):
+                if question_type == "date" and postprocess:
+                    bridge_ans = postprocess(str(bridge_ans))
+                elif question_type == "checkbox":
+                    if isinstance(bridge_ans, list):
+                        pass
+                    else:
+                        opts = options or []
+                        matched = [
+                            o for o in opts
+                            if o.lower() in str(bridge_ans).lower() or str(bridge_ans).lower() in o.lower()
+                        ]
+                        bridge_ans = matched or [str(bridge_ans)]
+                self.encountered_questions.append((question_text, bridge_ans, question_type))
+                logger.debug(f"Resolved {question_type} via LinkedIn data for '{question_text}': '{bridge_ans}'")
+                return bridge_ans
+
+        try:
+            raw = ai_fn()
+        except Exception as ai_err:
+            if self.use_linkedin_bridge:
+                raise NoInfoException(f"AI unavailable for question '{question_text}': {ai_err}") from ai_err
+            raise
+
+        if raise_on_no_info and self._is_no_info_answer(raw):
+            if self.use_linkedin_bridge and load_linkedin_configs().get("questions", {}).get("pause_at_failed_question", False):
+                logger.warning(f"pause_at_failed_question enabled — waiting 15s for manual edit on: {question_text}")
+                await async_pause(15, 15)
+            raise NoInfoException(f"No info found for question: {question_text}")
+
+        answer = postprocess(raw) if postprocess else raw
+        self._save_questions(Question(question_type=question_type, question=question_text, answer=answer))
+
+        if self.use_linkedin_bridge:
+            ans_str = ", ".join(answer) if isinstance(answer, list) else str(answer or "")
+            if ans_str.strip() and not self._is_no_info_answer(ans_str):
+                q_kind = "select" if question_type in ("dropdown", "radio", "checkbox") else "text"
+                upsert_saved_answers(
+                    [{"label": question_text, "answer": ans_str, "type": q_kind}],
+                    force_overwrite=False,
+                    path=self.saved_answers_path,
+                )
+            self.encountered_questions.append((question_text, answer, question_type))
+        return answer
+
+    async def _capture_manual_edits(self) -> None:
+        """Persist any values manually edited by the user before leaving the current step."""
+        try:
+            entries = []
+            for section, q_text, bot_val, q_kind in getattr(self, "_step_filled_inputs", []):
+                try:
+                    el = await find_element_safely(
+                        section,
+                        "input[type='text'], input[type='number'], input[type='tel'], input[type='email'], input[type='url'], textarea, select",
+                        timeout=100,
+                    )
+                    if not el:
+                        continue
+                    cur = (await el.input_value() or "").strip()
+                    if cur and cur != str(bot_val).strip():
+                        entries.append({"label": q_text, "answer": cur, "type": q_kind})
+                except Exception:
+                    continue
+            if entries:
+                upsert_saved_answers(entries, force_overwrite=True, path=self.saved_answers_path)
+            self._step_filled_inputs = []
+        except Exception:
+            pass
+
     async def _find_and_handle_date_question(self, section: Any) -> bool:
-        """Fill date input fields (MM/DD/YYYY format) using cache or LLM"""
+        """Fill date input fields (MM/DD/YYYY, DD/MM/YYYY, or ISO date) using cache or LLM"""
         date_input = await find_element_safely(
             section,
-            "input[placeholder='MM/DD/YYYY'], input[id^='date-question-input']",
+            "input[placeholder='MM/DD/YYYY'], input[placeholder='DD/MM/YYYY'], "
+            "input[id^='date-question-input'], input[type='date']",
             timeout=500,
         )
         if not date_input:
             return False
         question_text = await get_clean_text(section)
+        target_fmt = "%m/%d/%Y"
+        try:
+            raw_ph = await date_input.get_attribute("placeholder")
+            raw_type = await date_input.get_attribute("type")
+            ph = raw_ph.upper() if isinstance(raw_ph, str) else ""
+            itype = raw_type.lower() if isinstance(raw_type, str) else ""
+            if itype == "date":
+                target_fmt = "%Y-%m-%d"
+            elif "DD/MM" in ph:
+                target_fmt = "%d/%m/%Y"
+        except Exception:
+            pass
         try:
             self.previous_question_texts.append(question_text)
-            cached = self._find_cached_question(question_text, "date")
-            existing_answer = cached.answer if cached else None
-            if existing_answer:
-                answer = existing_answer
-                logger.debug(f"Using cached date answer for '{question_text}': '{answer}'")
-            else:
-                raw = self.gpt_answerer.answer_question_date(
+            answer = await self._resolve_question_answer(
+                question_text,
+                "date",
+                lambda: self.gpt_answerer.answer_question_date(
                     question_text, self.previous_question_texts[:-1]
-                )
-                if self._is_no_info_answer(raw):
-                    raise NoInfoException(f"No info found for question: {question_text}")
-                answer = self._parse_date_to_mmddyyyy(raw)
-                self._save_questions(
-                    Question(question_type="date", question=question_text, answer=answer)
-                )
+                ),
+                postprocess=lambda s: self._parse_date_to_mmddyyyy(s, target_fmt=target_fmt),
+            )
             await date_input.fill(answer)
+            if self.use_linkedin_bridge:
+                self._step_filled_inputs = getattr(self, "_step_filled_inputs", [])
+                self._step_filled_inputs.append((section, question_text, str(answer), "text"))
             logger.debug(f"Filled date field '{question_text}' with '{answer}'")
         except NoInfoException:
             raise
@@ -668,19 +1034,15 @@ class IndeedEasyApplier(BaseEasyApplier):
             return False
         return True
 
-    def _parse_date_to_mmddyyyy(self, date_str: str) -> str:
-        """Try to parse a date string and return it in MM/DD/YYYY format"""
-        formats = [
-            "%m/%d/%Y",
-            "%Y-%m-%d",
-            "%B %d, %Y",
-            "%b %d, %Y",
-            "%d/%m/%Y",
-            "%m-%d-%Y",
-        ]
+    def _parse_date_to_mmddyyyy(self, date_str: str, target_fmt: str = "%m/%d/%Y") -> str:
+        """Parse a date string and format it for MM/DD/YYYY, DD/MM/YYYY, or YYYY-MM-DD inputs."""
+        if target_fmt == "%d/%m/%Y":
+            formats = ["%d/%m/%Y", "%Y-%m-%d", "%B %d, %Y", "%b %d, %Y", "%m/%d/%Y", "%d-%m-%Y"]
+        else:
+            formats = ["%m/%d/%Y", "%Y-%m-%d", "%B %d, %Y", "%b %d, %Y", "%d/%m/%Y", "%m-%d-%Y"]
         for fmt in formats:
             try:
-                return datetime.strptime(date_str.strip(), fmt).strftime("%m/%d/%Y")
+                return datetime.strptime(date_str.strip(), fmt).strftime(target_fmt)
             except ValueError:
                 continue
         logger.warning(f"Could not parse date '{date_str}', using as-is")
@@ -714,43 +1076,61 @@ class IndeedEasyApplier(BaseEasyApplier):
             re.search(r"\b" + re.escape(kw) + r"\b", q) for kw in self._NUMERIC_QUESTION_KEYWORDS
         )
 
+    @staticmethod
+    def _strip_form_noise(text: str) -> str:
+        """Strip SmartApply UI helper/validation text from an extracted question label."""
+        cleaned = re.sub(
+            r"(?:Clear your answer\(s\)?|Choose an option to continue\.?|"
+            r"Choose at least \d+ options? to continue\.?|"
+            r"Enter an answer to continue\.?)",
+            "",
+            text or "",
+            flags=re.IGNORECASE,
+        )
+        return re.sub(r"\s+", " ", cleaned).strip()
+
     async def _find_and_handle_textbox_question(self, section: Any) -> bool:
-        """Fill appropriate textbox using cache or LLM"""
+        """Fill appropriate textbox using cache, LinkedIn data, or LLM"""
         text_input = await find_element_safely(
-            section, "input[type='text'], input[type='number'], textarea", timeout=500
+            section,
+            "input[type='text'], input[type='number'], input[type='tel'], input[type='email'], input[type='url'], textarea",
+            timeout=500,
         )
         if not text_input:
             return False
-        question_text = await get_clean_text(section)
+        question_text = self._strip_form_noise(await get_clean_text(section))
+        try:
+            if getattr(type(self.page), "__module__", "").startswith(("playwright", "patchright")):
+                existing_val = await text_input.input_value()
+                if isinstance(existing_val, str) and existing_val.strip() and question_text.endswith(existing_val.strip()):
+                    question_text = question_text[: -len(existing_val.strip())].strip()
+        except Exception:
+            pass
         try:
             self.previous_question_texts.append(question_text)
             is_numeric = await self._is_numeric_field(text_input, question_text)
             question_type = "numeric" if is_numeric else "text"
-            cached = self._find_cached_question(question_text, question_type)
-            existing_answer = cached.answer if cached else None
-            if existing_answer:
-                answer = existing_answer
-                logger.debug(f"Using cached answer for '{question_text}': '{answer}'")
-            elif is_numeric:
-                answer = self.gpt_answerer.answer_question_numeric(
-                    question_text, self.previous_question_texts[:-1]
-                )
-                if self._is_no_info_answer(answer):
-                    raise NoInfoException(f"No info found for question: {question_text}")
-                self._save_questions(
-                    Question(question_type="numeric", question=question_text, answer=answer)
+            if is_numeric:
+                answer = await self._resolve_question_answer(
+                    question_text,
+                    question_type,
+                    lambda: self.gpt_answerer.answer_question_numeric(
+                        question_text, self.previous_question_texts[:-1]
+                    ),
                 )
             else:
-                answer = self.gpt_answerer.answer_question_textual_wide_range(
-                    question_text, self.previous_question_texts[:-1]
+                answer = await self._resolve_question_answer(
+                    question_text,
+                    question_type,
+                    lambda: self.gpt_answerer.answer_question_textual_wide_range(
+                        question_text, self.previous_question_texts[:-1]
+                    ),
+                    postprocess=self.resume_anonymizer.deanonymize_text,
                 )
-                if self._is_no_info_answer(answer):
-                    raise NoInfoException(f"No info found for question: {question_text}")
-                answer = self.resume_anonymizer.deanonymize_text(answer)
-                self._save_questions(
-                    Question(question_type="text", question=question_text, answer=answer)
-                )
-            await text_input.fill(answer)
+            await text_input.fill(str(answer))
+            if self.use_linkedin_bridge:
+                self._step_filled_inputs = getattr(self, "_step_filled_inputs", [])
+                self._step_filled_inputs.append((section, question_text, str(answer), "text"))
             logger.debug(
                 f"Filled {'numeric' if is_numeric else 'text'} field '{question_text}' with '{answer}'"
             )
@@ -795,31 +1175,23 @@ class IndeedEasyApplier(BaseEasyApplier):
             # Remove options from question text
             for option in sorted(option_texts, key=lambda x: len(x), reverse=True):
                 question_text = question_text[::-1].replace(option[::-1], "", 1)[::-1]
-            question_text = re.sub(
-                r"Clear your answer(s)?", "", question_text, flags=re.IGNORECASE
-            ).strip()
+            question_text = self._strip_form_noise(question_text)
 
             if question_text:
                 self.previous_question_texts.append(question_text)
 
-            cached = self._find_cached_question(question_text, "checkbox")
-            existing_answer = cached.answer if cached else None
-            if existing_answer:
-                selected_options = (
-                    existing_answer if isinstance(existing_answer, list) else [existing_answer]
-                )
-                logger.debug(f"Using cached checkboxes for '{question_text}': {selected_options}")
-            else:
-                selected_options = self.gpt_answerer.select_many_answers_from_options(
+            resolved_cb = await self._resolve_question_answer(
+                question_text,
+                "checkbox",
+                lambda: self.gpt_answerer.select_many_answers_from_options(
                     question_text, option_texts, self.previous_question_texts[:-1]
-                )
-                self._save_questions(
-                    Question(
-                        question_type="checkbox",
-                        question=question_text,
-                        answer=selected_options,
-                    )
-                )
+                ),
+                options=option_texts,
+                raise_on_no_info=False,
+            )
+            selected_options = (
+                resolved_cb if isinstance(resolved_cb, list) else [resolved_cb]
+            )
             logger.debug(f"Selected checkboxes: {selected_options}")
 
             for cb, label_text in checkbox_data:
@@ -840,6 +1212,8 @@ class IndeedEasyApplier(BaseEasyApplier):
                                 continue
                         await cb.click()
                         logger.debug(f"Checked checkbox: '{label_text}'")
+        except NoInfoException:
+            raise
         except Exception as e:
             logger.warning(f"Error handling checkbox section: {e}")
             await debug_capture(self.page, "indeed_checkbox_error")
@@ -871,27 +1245,19 @@ class IndeedEasyApplier(BaseEasyApplier):
             # Remove options from question text
             for option in sorted(option_texts, key=lambda x: len(x), reverse=True):
                 question_text = question_text[::-1].replace(option[::-1], "", 1)[::-1]
-            question_text = re.sub(
-                r"Clear your answer(s)?", "", question_text, flags=re.IGNORECASE
-            ).strip()
+            question_text = self._strip_form_noise(question_text)
 
             if question_text:
                 self.previous_question_texts.append(question_text)
 
-            cached = self._find_cached_question(question_text, "radio")
-            existing_answer = cached.answer if cached else None
-            if existing_answer:
-                answer = existing_answer
-                logger.debug(f"Using cached radio answer for '{question_text}': '{answer}'")
-            else:
-                answer = self.gpt_answerer.select_one_answer_from_options(
+            answer = await self._resolve_question_answer(
+                question_text,
+                "radio",
+                lambda: self.gpt_answerer.select_one_answer_from_options(
                     question_text, option_texts, self.previous_question_texts[:-1]
-                )
-                if self._is_no_info_answer(answer):
-                    raise NoInfoException(f"No info found for question: {question_text}")
-                self._save_questions(
-                    Question(question_type="radio", question=question_text, answer=answer)
-                )
+                ),
+                options=option_texts,
+            )
 
             async def click_radio(radio: Any) -> None:
                 """Click via label when the input is visually hidden, else direct click."""
@@ -943,30 +1309,25 @@ class IndeedEasyApplier(BaseEasyApplier):
             # Remove options from question text
             for option in sorted(option_texts, key=lambda x: len(x), reverse=True):
                 question_text = question_text[::-1].replace(option[::-1], "", 1)[::-1]
-            question_text = re.sub(
-                r"Clear your answer(s)?", "", question_text, flags=re.IGNORECASE
-            ).strip()
+            question_text = self._strip_form_noise(question_text)
 
             self.previous_question_texts.append(question_text)
 
-            cached = self._find_cached_question(question_text, "dropdown")
-            existing_answer = cached.answer if cached else None
-            if existing_answer:
-                answer = existing_answer
-                logger.debug(f"Using cached dropdown answer for '{question_text}': '{answer}'")
-            else:
-                answer = self.gpt_answerer.select_one_answer_from_options(
+            answer = await self._resolve_question_answer(
+                question_text,
+                "dropdown",
+                lambda: self.gpt_answerer.select_one_answer_from_options(
                     question_text, option_texts, self.previous_question_texts[:-1]
-                )
-                if self._is_no_info_answer(answer):
-                    raise NoInfoException(f"No info found for question: {question_text}")
-                self._save_questions(
-                    Question(question_type="dropdown", question=question_text, answer=answer)
-                )
+                ),
+                options=option_texts,
+            )
             # Exact match first to avoid substring false positives
             for opt_text in option_texts:
                 if answer.lower() == opt_text.lower():
                     await dropdown.select_option(label=opt_text)
+                    if self.use_linkedin_bridge:
+                        self._step_filled_inputs = getattr(self, "_step_filled_inputs", [])
+                        self._step_filled_inputs.append((section, question_text, opt_text, "select"))
                     logger.debug(f"Selected dropdown option '{opt_text}'")
                     return True
             for opt_text in option_texts:
@@ -988,31 +1349,72 @@ class IndeedEasyApplier(BaseEasyApplier):
     async def _submit_application(self) -> bool:
         """Click the final submit button"""
         try:
-            captcha = await find_element_safely(self.page, "[data-testid='captcha']", timeout=20000)
-            if captcha:
-                logger.warning("Captcha detected before submission — pausing for manual solve")
+            is_real_page = getattr(type(self.page), "__module__", "").startswith(
+                ("playwright", "patchright")
+            )
+
+            async def _visible_captcha(wait_ms: int) -> Any:
+                el = await find_element_safely(self.page, "[data-testid='captcha']", timeout=wait_ms)
+                if el and is_real_page:
+                    try:
+                        if not await el.is_visible():
+                            return None
+                    except Exception:
+                        pass
+                return el
+
+            captcha = await _visible_captcha(1500)
+            if captcha or (
+                self.use_linkedin_bridge and await IndeedAuthenticator.is_security_challenge(self.page)
+            ):
+                logger.warning("Captcha / security verification detected before submission — pausing for manual solve")
                 while True:
-                    if not await find_element_safely(
-                        self.page, "[data-testid='captcha']", timeout=1000
-                    ):
+                    if should_stop():
+                        raise StopRequested("Stop requested while waiting for pre-submit verification")
+                    has_captcha = await _visible_captcha(1000)
+                    has_cf = (
+                        self.use_linkedin_bridge
+                        and await IndeedAuthenticator.is_security_challenge(self.page)
+                    )
+                    if not has_captcha and not has_cf:
                         break
-                    response = await self.page.locator("#g-recaptcha-response").input_value()
-                    if response:
-                        break
-                    await async_pause(3, 3)
+                    try:
+                        response = await self.page.locator("#g-recaptcha-response").input_value()
+                        if response and not has_cf:
+                            break
+                    except Exception:
+                        pass
+                    await async_pause(1.2, 2.8)
 
             submit_btn = await find_element_safely(
-                self.page, INDEED_SUBMIT_BUTTON_SELECTOR, timeout=20000
+                self.page, INDEED_SUBMIT_BUTTON_SELECTOR, timeout=15000
             )
             if not submit_btn:
                 logger.error("Submit button not found")
                 await debug_capture(self.page, "indeed_submit_button_not_found")
                 return False
 
+            await async_pause(0.4, 1.2)
             await submit_btn.click()
-            await async_pause(2, 4)
+            await async_pause(1.5, 3.2)
+
+            if self.use_linkedin_bridge:
+                confirmed = await find_element_safely(
+                    self.page,
+                    "[data-testid='ia-confirmation'], h1:has-text('submitted'), div:has-text('Application submitted'), :text-matches('your application has been submitted', 'i')",
+                    timeout=4000,
+                )
+                still_on_submit = await find_element_safely(
+                    self.page, INDEED_SUBMIT_BUTTON_SELECTOR, timeout=1000
+                )
+                if not confirmed and still_on_submit:
+                    logger.warning("Submit button still visible without confirmation")
+                    return False
+
             logger.info("Application submitted on Indeed")
             return True
+        except StopRequested:
+            raise
         except Exception as e:
             logger.error(f"Error submitting Indeed application: {e}", exc_info=True)
             await debug_capture(self.page, "indeed_submit_error")
@@ -1059,6 +1461,9 @@ class IndeedEasyApplier(BaseEasyApplier):
 
         for input_el in invalid_inputs:
             try:
+                raw_type = await input_el.get_attribute("type")
+                if isinstance(raw_type, str) and raw_type.lower() in ("radio", "checkbox", "file", "hidden"):
+                    continue
                 # Get the error message via aria-describedby → find the error element
                 described_by = await input_el.get_attribute("aria-describedby") or ""
                 error_text = ""

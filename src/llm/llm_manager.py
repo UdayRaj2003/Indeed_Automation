@@ -355,7 +355,13 @@ class AIAdapter:
         self.free_tier = FREE_TIER
         self.free_tier_rpm_limit = FREE_TIER_RPM_LIMIT
         self.free_tier_request_queue = deque(maxlen=self.free_tier_rpm_limit)
+        self._llm_proxy = llm_proxy
+        self._llm_api_url = llm_api_url
         self.model = self._create_model(api_key, llm_proxy, llm_api_url)
+
+    def rotate_api_key(self, new_key: str) -> None:
+        """Rebuild the underlying model with a rotated API key."""
+        self.model = self._create_model(new_key, self._llm_proxy, self._llm_api_url)
 
     def _create_model(self, api_key: str, llm_proxy: str, llm_api_url: str) -> AIModel:
         logger.info(f"Using {self.model_type} from {self.easy_apply_model}")
@@ -564,7 +570,19 @@ class LoggerChatModel:
 
                 return reply
 
-            except httpx.HTTPStatusError as e:
+            except Exception as e:
+                from src.job_manager.indeed.linkedin_bridge import ai_runtime
+
+                if ai_runtime.is_key_failover_error(e):
+                    if hasattr(self.llm, "rotate_api_key") and ai_runtime.try_rotate_or_disable(
+                        e, source="Indeed LLM"
+                    ):
+                        self.llm.rotate_api_key(ai_runtime.current_api_key())
+                        continue
+                    ai_runtime.disable_ai(e, source="Indeed LLM")
+                    raise
+                if not isinstance(e, httpx.HTTPStatusError):
+                    raise
                 logger.error(f"HTTPStatusError occurred: {str(e)}")
                 if e.response.status_code == 429:
                     retry_after = e.response.headers.get("retry-after")
@@ -860,7 +878,7 @@ class GPTAnswerer:
             self.job_readable = text
         else:
             self.job_readable = self.summarize_job_description(text)
-        logger.info(f"Adding job description: {self.job_readable}")
+        logger.debug(f"Adding job description: {self.job_readable}")
 
     def set_search_parameters(self, parameters: dict) -> None:
         """Set job search parameters."""
@@ -1042,7 +1060,7 @@ class GPTAnswerer:
 
     def summarize_job_description(self, text: str) -> str:
         """Create brief job description"""
-        logger.info(f"Creating brief job description: '{text}'")
+        logger.debug(f"Creating brief job description: '{text}'")
         chain = self.chains["summarize_job_description"]
         output = chain.invoke({"text": text})
         logger.debug(f"Generated brief description: {output}")

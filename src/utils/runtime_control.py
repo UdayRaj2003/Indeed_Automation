@@ -119,7 +119,8 @@ def attach_browser_close_watchers(browser: Any, context: Any, page: Any) -> asyn
             )
             browser_closed.set()
 
-    browser.on("disconnected", lambda: mark_closed("Browser"))
+    if browser is not None:
+        browser.on("disconnected", lambda: mark_closed("Browser"))
     context.on("close", lambda: mark_closed("Browser context"))
     page.on("close", lambda: mark_closed("Browser page"))
     return browser_closed

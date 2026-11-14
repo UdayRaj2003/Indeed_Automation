@@ -196,6 +196,7 @@ class BaseEasyApplier(ABC):
         """Check if answer contains company name"""
         return (
             isinstance(answer, str)
+            and getattr(self, "current_job", None) is not None
             and self.current_job.company_name is not None
             and self.current_job.company_name in answer
         )

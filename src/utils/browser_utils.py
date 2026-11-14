@@ -7,13 +7,14 @@ import re
 import time
 from typing import Any, List, Optional
 
+from config import app_config
 from config.app_config import HEADLESS_MODE, JOB_SITE
 
 if JOB_SITE == "indeed":
     from patchright.async_api import Browser, BrowserContext, Page, async_playwright
 else:
     from playwright.async_api import Browser, BrowserContext, Page, async_playwright
-from config.constants import BROWSER_STORAGE_STATE, DEBUG_DIR
+from config.constants import BROWSER_STORAGE_STATE, DEBUG_DIR, INDEED_CHROME_PROFILE_DIR
 from config.logger_config import logger
 
 try:  # TODO: add for back compatibility, remove this later
@@ -126,26 +127,74 @@ async def create_playwright_browser() -> tuple[Browser, BrowserContext, Page]:
         ]
 
         playwright = await async_playwright().start()
-        browser = await playwright.chromium.launch(
-            headless=HEADLESS_MODE,
-            args=args,
+        use_persistent = JOB_SITE == "indeed" and getattr(
+            app_config, "INDEED_USE_PERSISTENT_PROFILE", True
         )
+        if use_persistent:
+            profile_dir = os.path.abspath(
+                getattr(app_config, "INDEED_PROFILE_DIR", INDEED_CHROME_PROFILE_DIR)
+            )
+            os.makedirs(profile_dir, exist_ok=True)
+            persistent_args = [
+                "--start-maximized",
+                "--no-first-run",
+                "--no-default-browser-check",
+                "--disable-popup-blocking",
+                "--disable-blink-features=AutomationControlled",
+            ]
+            launch_kwargs = {
+                "user_data_dir": profile_dir,
+                "headless": HEADLESS_MODE,
+                "args": persistent_args,
+                "no_viewport": True,
+                "chromium_sandbox": True,
+                "locale": "en-IN",
+                "permissions": ["notifications"],
+                "extra_http_headers": {"Accept-Language": "en-IN,en-US;q=0.9,en;q=0.8"},
+            }
+            try:
+                context = await playwright.chromium.launch_persistent_context(
+                    channel="chrome", **launch_kwargs
+                )
+            except Exception as chrome_err:
+                if "ProcessSingleton" in str(chrome_err):
+                    logger.error(
+                        f"Close any open Chrome window using '{profile_dir}' first, then re-run."
+                    )
+                    raise
+                logger.warning(f"Persistent Chrome channel launch failed ({chrome_err}); trying fallback")
+                chrome_exe = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
+                if os.name == "nt" and os.path.isfile(chrome_exe):
+                    context = await playwright.chromium.launch_persistent_context(
+                        executable_path=chrome_exe, **launch_kwargs
+                    )
+                else:
+                    context = await playwright.chromium.launch_persistent_context(**launch_kwargs)
+            browser = None
+            page = context.pages[0] if context.pages else await context.new_page()
+            logger.info(f"Using persistent Chrome profile for Indeed: {profile_dir}")
+        else:
+            browser = await playwright.chromium.launch(
+                headless=HEADLESS_MODE,
+                args=args,
+            )
 
-        context = await browser.new_context(
-            viewport=viewport,
-            screen=viewport,
-            storage_state=storage_state,
-            locale="en-US",
-            permissions=["notifications"],
-            extra_http_headers={"Accept-Language": "en-US,en;q=0.9"},
-        )
+            context = await browser.new_context(
+                viewport=viewport,
+                screen=viewport,
+                storage_state=storage_state,
+                locale="en-US",
+                permissions=["notifications"],
+                extra_http_headers={"Accept-Language": "en-US,en;q=0.9"},
+            )
 
-        page = await context.new_page()
+            page = await context.new_page()
 
-        context.on(
-            "page",
-            lambda p: asyncio.ensure_future(p.set_viewport_size(viewport)),
-        )
+        if not use_persistent:
+            context.on(
+                "page",
+                lambda p: asyncio.ensure_future(p.set_viewport_size(viewport)),
+            )
 
         if DEBUG_MODE:
             await context.tracing.start(screenshots=True, snapshots=True, sources=True)
@@ -197,7 +246,10 @@ async def save_browser_session(context: BrowserContext) -> None:
 
         logger.info(f"Playwright session saved to {BROWSER_STORAGE_STATE}")
     except Exception as e:
-        logger.error(f"Failed to save Playwright session: {e}")
+        if any(msg in str(e) for msg in ("has been closed", "Connection closed")):
+            logger.debug(f"Skipped saving Playwright session (browser already closed): {e}")
+        else:
+            logger.error(f"Failed to save Playwright session: {e}")
 
 
 async def safe_click(
@@ -230,18 +282,43 @@ async def safe_click(
 
         await target.scroll_into_view_if_needed(timeout=500)
 
-        # Human-like pause before clicking
-        pause_time = random.uniform(0.1, 0.3)
-        await asyncio.sleep(pause_time)
+        # Human-like randomized pause before and after clicking (strictly under 5s)
+        pre_pause = round(random.uniform(0.3, 1.1), 2)
+        await asyncio.sleep(pre_pause)
 
         await target.click(timeout=timeout)
         logger.debug(f"Successfully clicked: {selector}")
+
+        post_pause = round(random.uniform(0.4, 1.3), 2)
+        await asyncio.sleep(post_pause)
         return True
 
     except Exception as e:
         logger.warning(f"Failed to click element '{selector}': {e}")
         await debug_capture(page, "click_failed")
         return False
+
+
+async def random_click(
+    element: Any,
+    low: float = 0.3,
+    high: float = 1.1,
+    post_low: float = 0.4,
+    post_high: float = 1.3,
+    **click_kwargs,
+) -> None:
+    """Click an element with genuine randomized human timing strictly under 5 seconds."""
+    pre = round(random.uniform(low, min(float(high), 4.8)), 2)
+    if pre > 0:
+        await asyncio.sleep(pre)
+    click_fn = getattr(element, "click", None)
+    if callable(click_fn):
+        await element.click(**click_kwargs)
+    elif hasattr(element, "evaluate"):
+        await element.evaluate("el => el.click()")
+    post = round(random.uniform(post_low, min(float(post_high), 4.8)), 2)
+    if post > 0:
+        await asyncio.sleep(post)
 
 
 async def safe_fill(

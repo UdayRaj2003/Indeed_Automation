@@ -93,6 +93,16 @@ class TestApplyToJob:
         applier.page.goto.assert_called_once_with(test_job.url)
         assert result == (("Success", ""), None)
 
+    @pytest.mark.asyncio
+    async def test_skip_navigation_skips_goto(self, applier, test_job):
+        applier.submitted_resume_path = None
+        applier.job_easy_apply = AsyncMock(return_value=("Success", ""))
+        with patch("src.job_manager.indeed.easy_applier_indeed.emit_event"):
+            with patch("src.job_manager.indeed.easy_applier_indeed.async_pause"):
+                result = await applier.apply_to_job(test_job, skip_navigation=True)
+        applier.page.goto.assert_not_called()
+        assert result == (("Success", ""), None)
+
 
 class TestJobEasyApply:
     @pytest.mark.asyncio
@@ -853,3 +863,107 @@ class TestFillRelevantExperiencePage:
             await applier._fill_relevant_experience_page()
 
         title_input.fill.assert_not_called()
+
+
+class TestResumeSelection:
+    @pytest.mark.asyncio
+    async def test_cv_options_upload_via_file_input(self, applier, test_job, tmp_path):
+        resume_pdf = tmp_path / "tailored.pdf"
+        resume_pdf.write_bytes(b"%PDF-1.4")
+        applier.pre_resolved_resume_path = str(resume_pdf)
+        applier.page.expect_file_chooser = None
+
+        options_btn = AsyncMock()
+        alt_btn = AsyncMock()
+        file_input = AsyncMock()
+
+        async def mock_find(page, selector, timeout=None):
+            if "CV options" in selector:
+                return options_btn
+            if "Upload a different file" in selector:
+                return alt_btn
+            if selector == "input[type='file']":
+                return file_input
+            return None
+
+        with patch(
+            "src.job_manager.indeed.easy_applier_indeed.find_element_safely",
+            new_callable=AsyncMock,
+            side_effect=mock_find,
+        ):
+            with patch("src.job_manager.indeed.easy_applier_indeed.async_pause", new_callable=AsyncMock):
+                await applier._handle_resume_selection(test_job)
+
+        options_btn.click.assert_awaited_once()
+        alt_btn.click.assert_awaited_once()
+        file_input.set_input_files.assert_awaited_once_with(str(resume_pdf.resolve()))
+        assert applier.submitted_resume_path == str(resume_pdf.resolve())
+
+    @pytest.mark.asyncio
+    async def test_cv_options_upload_via_file_chooser(self, applier, test_job, tmp_path):
+        resume_pdf = tmp_path / "chooser.pdf"
+        resume_pdf.write_bytes(b"%PDF-1.4")
+        applier.pre_resolved_resume_path = str(resume_pdf)
+
+        options_btn = AsyncMock()
+        alt_btn = AsyncMock()
+        file_chooser = AsyncMock()
+
+        class FakeFileChooserCM:
+            async def __aenter__(self):
+                self.value = AsyncMock(return_value=file_chooser)()
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+        applier.page.expect_file_chooser = MagicMock(return_value=FakeFileChooserCM())
+
+        async def mock_find(page, selector, timeout=None):
+            if "CV options" in selector:
+                return options_btn
+            if "Upload a different file" in selector:
+                return alt_btn
+            return None
+
+        with patch(
+            "src.job_manager.indeed.easy_applier_indeed.find_element_safely",
+            new_callable=AsyncMock,
+            side_effect=mock_find,
+        ):
+            with patch("src.job_manager.indeed.easy_applier_indeed.async_pause", new_callable=AsyncMock):
+                await applier._handle_resume_selection(test_job)
+
+        options_btn.click.assert_awaited_once()
+        alt_btn.click.assert_awaited_once()
+        file_chooser.set_files.assert_awaited_once_with(str(resume_pdf.resolve()))
+        assert applier.submitted_resume_path == str(resume_pdf.resolve())
+
+    @pytest.mark.asyncio
+    async def test_fill_up_detects_cv_options_only_before_upload(self, applier, test_job):
+        applier.pre_resolved_resume_path = "C:/resumes/tailored.pdf"
+        options_btn = AsyncMock()
+
+        async def mock_find(page, selector, timeout=None):
+            if "CV options" in selector:
+                return options_btn
+            return None
+
+        with patch(
+            "src.job_manager.indeed.easy_applier_indeed.find_element_safely",
+            new_callable=AsyncMock,
+            side_effect=mock_find,
+        ):
+            with patch(
+                "src.job_manager.indeed.easy_applier_indeed.find_elements_safely",
+                new_callable=AsyncMock,
+                return_value=[],
+            ):
+                with patch.object(applier, "_handle_resume_selection", new_callable=AsyncMock) as handle_mock:
+                    await applier._fill_up(test_job)
+                    handle_mock.assert_awaited_once_with(test_job)
+
+                    applier.submitted_resume_path = applier.pre_resolved_resume_path
+                    await applier._fill_up(test_job)
+                    assert handle_mock.await_count == 1
+

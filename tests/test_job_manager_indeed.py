@@ -216,12 +216,14 @@ class TestExtractJobFromCard:
         ):
             job = await manager._extract_job_from_card(card)
 
+        from src.job_manager.indeed import indeed_base_url
+
         assert job is not None
         assert job.job_title == "software engineer"
         assert job.company_name == "tech corp"
         assert job.location == "new york"
         assert job.apply_method == "easy_apply"
-        assert job.url == "https://www.indeed.com/viewjob?jk=abc1"
+        assert job.url == f"{indeed_base_url()}/viewjob?jk=abc1"
 
     @pytest.mark.asyncio
     async def test_returns_none_when_no_title_element(self, manager):
@@ -688,3 +690,192 @@ class TestApplyJob:
             result = await manager.apply_job(AsyncMock())
 
         assert result == "Skip"
+
+    @pytest.mark.asyncio
+    async def test_test_mode_uses_non_llm_set_job(self, manager, mock_page, test_job):
+        self._setup_manager(manager)
+        new_page = AsyncMock()
+        mock_page.context.new_page = AsyncMock(return_value=new_page)
+
+        mock_llm = MagicMock()
+        mock_llm.job_is_interesting.return_value = (True, 80, "Great fit")
+        mock_llm.set_job = MagicMock()
+        manager.llm_answerer_component = mock_llm
+
+        with (
+            patch.object(
+                manager, "_extract_job_from_card", new_callable=AsyncMock, return_value=test_job
+            ),
+            patch.object(
+                manager,
+                "_extract_job_description_from_page",
+                new_callable=AsyncMock,
+                return_value="desc",
+            ),
+            patch.object(
+                manager,
+                "_extract_company_description",
+                new_callable=AsyncMock,
+                return_value="about",
+            ),
+            patch.object(
+                manager, "easy_apply", new_callable=AsyncMock, return_value=("Success", "")
+            ),
+            patch.object(manager, "_handle_apply_result", new_callable=AsyncMock),
+            patch("src.job_manager.indeed.job_manager_indeed.async_pause"),
+            patch("src.job_manager.indeed.job_manager_indeed.COLLECT_INFO_MODE", False),
+            patch("src.job_manager.indeed.job_manager_indeed.MONKEY_MODE", False),
+            patch("src.job_manager.indeed.job_manager_indeed.EASY_APPLY_ONLY_MODE", True),
+            patch("src.job_manager.indeed.job_manager_indeed.TEST_MODE", True),
+        ):
+            result = await manager.apply_job(AsyncMock())
+
+        assert result == "Success"
+        mock_llm.set_job.assert_called_once()
+        assert mock_llm.set_job.call_args.kwargs.get("is_test") is True
+
+    @pytest.mark.asyncio
+    async def test_apply_job_ignores_closed_browser_in_finally(self, manager, mock_page, test_job):
+        self._setup_manager(manager)
+        new_page = AsyncMock()
+        new_page.close = AsyncMock(side_effect=Exception("Connection closed while reading from the driver"))
+        mock_page.bring_to_front = AsyncMock(side_effect=Exception("Target page closed"))
+        mock_page.context.new_page = AsyncMock(return_value=new_page)
+        mock_llm = MagicMock()
+        mock_llm.job_is_interesting.return_value = (True, 80, "Great fit")
+        mock_llm.set_job = MagicMock()
+        manager.llm_answerer_component = mock_llm
+
+        with (
+            patch.object(
+                manager, "_extract_job_from_card", new_callable=AsyncMock, return_value=test_job
+            ),
+            patch.object(
+                manager, "_extract_job_description_from_page", new_callable=AsyncMock, return_value="desc"
+            ),
+            patch.object(
+                manager, "_extract_company_description", new_callable=AsyncMock, return_value="about"
+            ),
+            patch.object(manager, "easy_apply", new_callable=AsyncMock, return_value=("Skip", "Stopped")),
+            patch.object(manager, "_handle_apply_result", new_callable=AsyncMock),
+            patch("src.job_manager.indeed.job_manager_indeed.async_pause"),
+            patch("src.job_manager.indeed.job_manager_indeed.COLLECT_INFO_MODE", False),
+            patch("src.job_manager.indeed.job_manager_indeed.MONKEY_MODE", False),
+            patch("src.job_manager.indeed.job_manager_indeed.EASY_APPLY_ONLY_MODE", True),
+            patch("src.job_manager.indeed.job_manager_indeed.TEST_MODE", True),
+        ):
+            result = await manager.apply_job(AsyncMock())
+
+        assert result == "Skip"
+
+    @pytest.mark.asyncio
+    async def test_condition_skip_uses_list_pane_without_new_tab_or_skipped_yaml(
+        self, manager, mock_page, test_job
+    ):
+        self._setup_manager(manager)
+        manager.rejected_jobs = set()
+        mock_page.context.new_page = AsyncMock()
+        mock_llm = MagicMock()
+        mock_llm.job_is_interesting.return_value = (False, 20, "Not relevant")
+        manager.llm_answerer_component = mock_llm
+
+        with (
+            patch.object(
+                manager, "_extract_job_from_card", new_callable=AsyncMock, return_value=test_job
+            ),
+            patch.object(
+                manager, "_extract_job_description_from_page", new_callable=AsyncMock, return_value="desc"
+            ),
+            patch.object(
+                manager, "_extract_company_description", new_callable=AsyncMock, return_value="about"
+            ),
+            patch.object(manager, "_handle_apply_result", new_callable=AsyncMock) as mock_handle,
+            patch("src.job_manager.indeed.job_manager_indeed.COLLECT_INFO_MODE", False),
+            patch("src.job_manager.indeed.job_manager_indeed.MONKEY_MODE", False),
+            patch("src.job_manager.indeed.job_manager_indeed.EASY_APPLY_ONLY_MODE", True),
+            patch("src.job_manager.indeed.job_manager_indeed.TEST_MODE", False),
+        ):
+            result1 = await manager.apply_job(AsyncMock())
+            result2 = await manager.apply_job(AsyncMock())
+
+        assert result1 == "Skip"
+        assert result2 == "Skip"
+        mock_page.context.new_page.assert_not_called()
+        assert mock_handle.call_count == 1
+        assert mock_handle.call_args.kwargs.get("persist_skip") is False
+        assert "abc123" in manager.rejected_jobs
+
+    @pytest.mark.asyncio
+    async def test_apply_job_opens_tab_once_with_skip_navigation_when_conditions_pass(
+        self, manager, mock_page, test_job
+    ):
+        self._setup_manager(manager)
+        manager.rejected_jobs = set()
+        new_page = AsyncMock()
+        mock_page.context.new_page = AsyncMock(return_value=new_page)
+        mock_llm = MagicMock()
+        mock_llm.job_is_interesting.return_value = (True, 85, "Good fit")
+        mock_llm.set_job = MagicMock()
+        manager.llm_answerer_component = mock_llm
+
+        with (
+            patch.object(
+                manager, "_extract_job_from_card", new_callable=AsyncMock, return_value=test_job
+            ),
+            patch.object(
+                manager, "_extract_job_description_from_page", new_callable=AsyncMock, return_value="desc"
+            ),
+            patch.object(
+                manager, "_extract_company_description", new_callable=AsyncMock, return_value="about"
+            ),
+            patch.object(
+                manager, "easy_apply", new_callable=AsyncMock, return_value=("Success", "")
+            ) as mock_easy_apply,
+            patch.object(manager, "_handle_apply_result", new_callable=AsyncMock),
+            patch("src.job_manager.indeed.job_manager_indeed.async_pause"),
+            patch("src.job_manager.indeed.job_manager_indeed.COLLECT_INFO_MODE", False),
+            patch("src.job_manager.indeed.job_manager_indeed.MONKEY_MODE", False),
+            patch("src.job_manager.indeed.job_manager_indeed.EASY_APPLY_ONLY_MODE", True),
+            patch("src.job_manager.indeed.job_manager_indeed.TEST_MODE", True),
+        ):
+            result = await manager.apply_job(AsyncMock())
+
+        assert result == "Success"
+        mock_page.context.new_page.assert_called_once()
+        new_page.goto.assert_called_once_with(test_job.url, wait_until="domcontentloaded")
+        mock_easy_apply.assert_called_once_with(test_job, new_page, skip_navigation=True)
+
+    @pytest.mark.asyncio
+    async def test_focus_card_in_list_pane_waits_for_jd_change(self, manager, mock_page, test_job):
+        self._setup_manager(manager)
+        card = AsyncMock()
+        title_el = AsyncMock()
+        mock_page.url = "https://in.indeed.com/jobs?q=dev&vjk=abc123"
+        stale_jd = "Old card JD content longer than 20 characters"
+        new_jd = "Updated target card JD content longer than 20 chars"
+
+        with (
+            patch.object(manager, "_is_real_page", return_value=True),
+            patch.object(
+                manager,
+                "_extract_job_description_from_page",
+                new_callable=AsyncMock,
+                side_effect=[stale_jd, stale_jd, new_jd],
+            ),
+            patch.object(
+                manager,
+                "_right_pane_matches_job",
+                new_callable=AsyncMock,
+                side_effect=[False, True, True],
+            ),
+            patch(
+                "src.job_manager.indeed.job_manager_indeed.find_element_safely",
+                new_callable=AsyncMock,
+                return_value=title_el,
+            ),
+            patch("src.job_manager.indeed.job_manager_indeed.asyncio.sleep", new_callable=AsyncMock),
+        ):
+            focused = await manager._focus_card_in_list_pane(card, test_job, "abc123")
+
+        assert focused is True
+        title_el.evaluate.assert_called_once_with("el => el.click()")

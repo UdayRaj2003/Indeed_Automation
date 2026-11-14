@@ -1,0 +1,34 @@
+positions:
+- Software Engineer
+- Python Developer
+- Full Stack Developer
+remote: true
+hybrid: true
+onsite: true
+experience_level:
+  internship: false
+  entry: true
+  associate: true
+  mid_senior_level: false
+  director: false
+  executive: false
+job_types:
+  full_time: true
+  contract: false
+  part_time: false
+  temporary: false
+  volunteer: false
+  internship: false
+  other: false
+date:
+  all_time: false
+  month: false
+  week: false
+  24_hours: true
+locations:
+- India
+apply_once_at_company: false
+company_blacklist: []
+title_blacklist: []
+location_blacklist: []
+

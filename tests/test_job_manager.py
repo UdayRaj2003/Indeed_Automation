@@ -961,6 +961,55 @@ class TestHandleApplyResult:
         assert mock_emit_event.call_args.kwargs["result"] == "test"
 
     @pytest.mark.asyncio
+    async def test_handle_apply_result_test_mode_skip_is_not_recorded(self, job_applier):
+        job_applier.applies_num = 0
+        job_applier.cache = JobManagerCache()
+        job = Job(
+            job_title="Software Engineer",
+            company_name="Tech Corp",
+            url="https://in.indeed.com/viewjob?jk=1",
+        )
+
+        with (
+            patch("src.job_manager.job_manager.emit_event"),
+            patch("src.job_manager.job_manager.TEST_MODE", True),
+            patch("src.job_manager.job_manager.COLLECT_INFO_MODE", False),
+            patch.object(job_applier, "_save_company") as mock_save_company,
+            patch.object(job_applier, "_save_interesting_job") as mock_save_interesting,
+        ):
+            await job_applier._handle_apply_result(("Skip", "Test mode"), job)
+
+        mock_save_company.assert_not_called()
+        mock_save_interesting.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_handle_apply_result_skip_without_persist_does_not_write_yaml(
+        self, job_applier
+    ):
+        job_applier.applies_num = 0
+        job_applier.cache = JobManagerCache()
+        job = Job(
+            job_title="Senior Engineer",
+            company_name="Tech Corp",
+            url="https://in.indeed.com/viewjob?jk=2",
+        )
+
+        with (
+            patch("src.job_manager.job_manager.emit_event"),
+            patch("src.job_manager.job_manager.TEST_MODE", False),
+            patch("src.job_manager.job_manager.COLLECT_INFO_MODE", False),
+            patch.object(job_applier, "_save_company") as mock_save_company,
+            patch.object(job_applier, "_save_interesting_job") as mock_save_interesting,
+        ):
+            await job_applier._handle_apply_result(
+                ("Skip", "Required experience is high"), job, persist_skip=False
+            )
+
+        assert job_applier.applies_num == 1
+        mock_save_company.assert_not_called()
+        mock_save_interesting.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_handle_apply_result_passes_evaluation_to_save_company(self, job_applier):
         job_applier.applies_num = 0
         job_applier.success_applies_num = 0

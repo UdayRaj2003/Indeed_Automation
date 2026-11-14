@@ -27,20 +27,32 @@ share/python-wheels/
 *.egg
 MANIFEST
 
-# Project temporary files
+# Project temporary and output files
+browser_session/
 browser_session/*
 browser_session_my/*
 browser_session_work/*
 config/app_config*.py
 config/*.yaml
+!config/*.example.yaml
+config/secrets.py
+secrets.py
 data/cover_letters/*
 data/output/*
 data/resumes/*
 data/debug/*
 data/photo/*
+all resumes/
+all resumes/*
+all excels/
+all excels/*
+*.pdf
+*.csv
 src/telegram/error_cache.yaml
 prev_err_msg.yaml
 logs/*
+logs/
+*.log
 
 # PyInstaller
 # Usually these files are written by a python script from a template
@@ -122,7 +134,12 @@ celerybeat.pid
 
 # Environments and cookies
 .env
+.env.*
+*.env
+*.env.local
+!.env.example
 .venv
+.venv/
 env/
 venv/
 ENV/

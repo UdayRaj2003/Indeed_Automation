@@ -56,12 +56,17 @@ class BotFacade:
         self.state.parameters_set = True
         logger.info("All parameters set successfully")
 
-    async def set_search_parameters(self, parameters: Dict[str, Any]) -> None:
+    async def set_search_parameters(
+        self, parameters: Dict[str, Any], *, per_term: bool = False, randomize: bool = False
+    ) -> None:
         """Set search parameters (async)"""
         logger.info("Setting search parameters")
         self._validate_non_empty(parameters, "Parameters")
         self.search_component.set_advanced_search_params(parameters)
-        await self.search_component.set_search_params()
+        if per_term:
+            await self.search_component.set_search_params(per_term=True, randomize=randomize)
+        else:
+            await self.search_component.set_search_params()
         self.state.search_parameters_set = True
         logger.info("Search parameters successfully set")
 

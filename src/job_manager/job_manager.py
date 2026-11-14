@@ -461,6 +461,7 @@ class BaseJobManager(ABC):
         apply_result: Tuple[str, str],
         job: Job,
         evaluation: Dict[str, Any] | None = None,
+        persist_skip: bool = True,
     ) -> None:
         """Handle the result of a job application attempt"""
         result, _ = apply_result
@@ -481,11 +482,11 @@ class BaseJobManager(ABC):
             # otherwise a real run would skip this vacancy (and, via success.yaml, the whole company).
             logger.info(f"Test mode: form filled but not submitted for {job.job_title}")
             return
-        if result != "Limit" and COLLECT_INFO_MODE is False:
+        if not TEST_MODE and result != "Limit" and COLLECT_INFO_MODE is False:
             if self._should_save_skip_as_interesting(apply_result):
                 score = (evaluation or {}).get("interest_score") or 0
                 self._save_interesting_job(job, score=score, reasoning=apply_result[1])
-            else:
+            elif result != "Skip" or persist_skip:
                 self._save_company(job, apply_result, {"url": job.url}, evaluation=evaluation)
         if result == "Success":
             self.success_applies_num += 1

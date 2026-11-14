@@ -1,8 +1,9 @@
 """Test suite for src/utils/utils.py"""
 
+import os
 import time
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import yaml
@@ -120,7 +121,8 @@ class TestSaveYamlFile:
         save_yaml_file(yaml_file, {"status": "saved"})
 
         assert yaml_file.exists()
-        assert mock_fsync.call_count >= 2
+        expected_min = 2 if hasattr(os, "O_DIRECTORY") else 1
+        assert mock_fsync.call_count >= expected_min
         assert list(tmp_path.glob("*.tmp")) == []
 
 
@@ -153,6 +155,31 @@ class TestPause:
 
         # Should be very close to 0
         assert elapsed < 0.1
+
+    def test_pause_caps_under_five_seconds_and_randomizes(self):
+        """Action pauses must stay under 5 seconds and maintain random spread"""
+        with patch("src.utils.utils.time.sleep") as mock_sleep:
+            pause(8, 8)
+            mock_sleep.assert_called_once()
+            val = mock_sleep.call_args[0][0]
+            assert 0.1 <= val <= 4.8
+
+    @pytest.mark.asyncio
+    async def test_async_pause_caps_under_five_seconds(self):
+        """Async action pauses must stay strictly under 5 seconds"""
+        with patch("src.utils.utils.asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+            from src.utils.utils import async_click_pause, async_pause
+
+            await async_pause(6, 9)
+            mock_sleep.assert_awaited_once()
+            val = mock_sleep.call_args[0][0]
+            assert 0.1 <= val <= 4.8
+
+            mock_sleep.reset_mock()
+            await async_click_pause(1, 3)
+            mock_sleep.assert_awaited_once()
+            val2 = mock_sleep.call_args[0][0]
+            assert 1.0 <= val2 <= 3.0
 
 
 class TestSleep:
