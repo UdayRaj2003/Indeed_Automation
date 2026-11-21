@@ -450,7 +450,16 @@ class IndeedJobManager(BaseJobManager):
                 return new_page
             new_page = await self.page.context.new_page()
             is_real = self._is_real_page(new_page)
-            await new_page.goto(job.url, wait_until="domcontentloaded")
+            try:
+                await new_page.goto(job.url, wait_until="domcontentloaded")
+            except Exception as e:
+                logger.warning(f"Could not open job page for {job.url}: {e}")
+                try:
+                    await new_page.close()
+                except Exception:
+                    pass
+                new_page = None
+                return None
             await async_pause(1, 2)
             if is_real and await IndeedAuthenticator.is_security_challenge(new_page):
                 cleared = await IndeedAuthenticator(new_page).wait_for_manual_challenge_if_present()

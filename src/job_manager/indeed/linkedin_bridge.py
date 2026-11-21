@@ -1179,6 +1179,7 @@ def prepare_tailored_resume_pdf(
             str(output_dir),
             str(result_json),
             template_name,
+            company_name,
         ]
         env = os.environ.copy()
         existing_pp = env.get("PYTHONPATH", "")

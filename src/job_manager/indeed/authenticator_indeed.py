@@ -1,3 +1,4 @@
+import asyncio
 import time
 from typing import Union
 
@@ -95,7 +96,16 @@ class IndeedAuthenticator(BaseAuthenticator):
         try:
             if should_stop():
                 raise StopRequested("Stop requested before Indeed login check")
-            await self.page.goto(self.INDEED_HOME_URL, wait_until="domcontentloaded")
+            for _attempt in range(1, 4):
+                try:
+                    await self.page.goto(self.INDEED_HOME_URL, wait_until="domcontentloaded")
+                    break
+                except Exception as _e:
+                    if _attempt < 3 and any(k in str(_e) for k in ("ERR_NAME_NOT_RESOLVED", "ERR_INTERNET_DISCONNECTED", "ERR_CONNECTION", "Timeout")):
+                        logger.warning(f"Indeed home navigation failed (attempt {_attempt}/3): {_e}. Retrying in {_attempt * 2}s...")
+                        await asyncio.sleep(_attempt * 2)
+                    else:
+                        raise
             logger.info("Checking if user is logged into Indeed...")
 
             if await self.is_security_challenge(self.page):
@@ -157,7 +167,16 @@ class IndeedAuthenticator(BaseAuthenticator):
         try:
             if should_stop():
                 raise StopRequested("Stop requested before Indeed login navigation")
-            await self.page.goto(self.INDEED_LOGIN_URL)
+            for _attempt in range(1, 4):
+                try:
+                    await self.page.goto(self.INDEED_LOGIN_URL)
+                    break
+                except Exception as _e:
+                    if _attempt < 3 and any(k in str(_e) for k in ("ERR_NAME_NOT_RESOLVED", "ERR_INTERNET_DISCONNECTED", "ERR_CONNECTION", "Timeout")):
+                        logger.warning(f"Indeed login navigation failed (attempt {_attempt}/3): {_e}. Retrying in {_attempt * 2}s...")
+                        await asyncio.sleep(_attempt * 2)
+                    else:
+                        raise
             await async_pause(1, 2)
             if should_stop():
                 raise StopRequested("Stop requested during Indeed login")

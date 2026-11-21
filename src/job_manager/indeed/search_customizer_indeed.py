@@ -2,6 +2,7 @@
 Module for customizing Indeed job search parameters.
 """
 
+import asyncio
 from random import shuffle
 from typing import Any, List, Union
 from urllib.parse import quote_plus
@@ -148,10 +149,20 @@ class IndeedSearchCustomizer(BaseSearchCustomizer):
             return self.search_terms_for_urls[self._search_url_index]
         return self._build_query()
 
-    async def _goto_search_url(self, url: str) -> None:
+    async def _goto_search_url(self, url: str, attempts: int = 3) -> None:
         logger.info(f"Navigating to Indeed search: {url}")
-        await self.page.goto(url, wait_until="domcontentloaded")
-        await async_pause(2, 3)
+        for i in range(1, attempts + 1):
+            try:
+                await self.page.goto(url, wait_until="domcontentloaded")
+                await async_pause(2, 3)
+                return
+            except Exception as e:
+                msg = str(e)
+                if i < attempts and any(k in msg for k in ("ERR_NAME_NOT_RESOLVED", "ERR_INTERNET_DISCONNECTED", "ERR_CONNECTION", "Timeout")):
+                    logger.warning(f"Indeed search navigation failed (attempt {i}/{attempts}): {msg[:150]}. Retrying...")
+                    await asyncio.sleep(i * 2)
+                else:
+                    raise
 
     async def set_search_params(
         self, *, per_term: bool = False, randomize: bool = False
@@ -179,8 +190,14 @@ class IndeedSearchCustomizer(BaseSearchCustomizer):
 
     async def go_to_next_search(self) -> bool:
         """Navigate to the next configured search. False when all are exhausted."""
-        if self._search_url_index + 1 >= len(self.search_urls):
-            return False
-        self._search_url_index += 1
-        await self._goto_search_url(self.search_urls[self._search_url_index])
-        return True
+        while self._search_url_index + 1 < len(self.search_urls):
+            self._search_url_index += 1
+            try:
+                await self._goto_search_url(self.search_urls[self._search_url_index])
+                return True
+            except Exception as e:
+                logger.warning(
+                    f"Could not open search URL for '{self.current_search_term}': {e}. Skipping to next..."
+                )
+                continue
+        return False

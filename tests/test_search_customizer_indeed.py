@@ -230,3 +230,20 @@ class TestSetSearchParams:
 
         call_kwargs = mock_page.goto.call_args[1]
         assert call_kwargs.get("wait_until") == "domcontentloaded"
+
+    @pytest.mark.asyncio
+    async def test_go_to_next_search_skips_failed_url(self, mock_page):
+        sc = IndeedSearchCustomizer(mock_page)
+        sc.search_urls = ["http://first", "http://second_fails", "http://third_ok"]
+        sc.search_terms_for_urls = ["first", "second", "third"]
+        sc._search_url_index = 0
+
+        async def fake_goto(url, **kwargs):
+            if "second_fails" in url:
+                raise Exception("net::ERR_NAME_NOT_RESOLVED")
+
+        mock_page.goto = MagicMock(side_effect=fake_goto)
+        with patch(f"{MODULE}.async_pause"):
+            result = await sc.go_to_next_search()
+        assert result is True
+        assert sc._search_url_index == 2
